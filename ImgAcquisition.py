@@ -226,6 +226,13 @@ def get_hsv_range(bgr: np.ndarray, hsv_range: (int, int, int)):
 
     pass
 
+def get_rotation_matrix(start_angle, end_angle):
+    rads = np.expand_dims(np.radians(np.arange(start_angle, end_angle)), 1)
+
+    return np.dstack((np.hstack((np.cos(rads), -np.sin(rads))),
+                      np.hstack((np.sin(rads), np.cos(rads)))))
+
+
 
 def get_camera_img(child_comm_mp, img_view, bgr_range):
     '''while not child_comm_mp[ChildCommIdxs.img_loaded]:
@@ -245,10 +252,7 @@ def get_camera_img(child_comm_mp, img_view, bgr_range):
     return img
 
 
-
-
-
-def np_dtype_from_maxval(max_val, signed=False):
+def np_dtype_from_max(max_val, signed=False):
     if not signed:
         if max_val <= 1:
             return np.bool_
@@ -271,15 +275,15 @@ def np_dtype_from_maxval(max_val, signed=False):
             return np.uint64
 
 
-def return_contour_data_from_cam(child_comm_mp, img_view, hsv_ranges, desired_data_count, prompt, prompt_delay=1, all_valid=False, area_cutoffs=None):
+def return_contour_data_from_cam(child_comm_mp, img_view, hsv_ranges, desired_data_count, sample_count, prompt, prompt_delay=1, all_valid=False, area_cutoffs=None):
     contour_areas = np.zeros((desired_data_count, hsv_ranges.shape[0]), dtype=np.uint16)
-    counts = np.zeros(hsv_ranges.shape[0], dtype=np_dtype_from_maxval(desired_data_count))
-    bboxs = np.zeros((hsv_ranges.shape[0], 4), dtype=np_dtype_from_maxval(np.max(Camera.max_aoi_yx.max()), signed=True))
+    counts = np.zeros(hsv_ranges.shape[0], dtype=np_dtype_from_max(desired_data_count))
+    bboxs = np.zeros((hsv_ranges.shape[0], 4), dtype=np_dtype_from_max(np.max(Camera.max_aoi_yx.max()), signed=True))
     contours_all = [[] for _ in range(hsv_ranges.shape[0])]
     if area_cutoffs is None: area_cutoffs = np.zeros(hsv_ranges.shape[0], dtype=np.bool_)
 
     print(prompt), print(f'Starting data collection in {prompt_delay} seconds'), time.sleep(prompt_delay), print('Starting data collection')
-    while np.any(counts != desired_data_count):
+    while np.any(counts != sample_count):
         idxs = np.argwhere(counts != desired_data_count).flatten()
         cam_img = cv2.cvtColor(get_camera_img(child_comm_mp, img_view, hsv_ranges), cv2.COLOR_BGR2HSV)
         contours, area = get_contours_from_hsv_img(cam_img, hsv_ranges[idxs], bboxs, area_cutoffs[idxs], all_valid)
@@ -297,10 +301,9 @@ def return_contour_data_from_cam(child_comm_mp, img_view, hsv_ranges, desired_da
 
     contour_end_idxs = np.column_stack(contour_end_idxs)
     contour_start_idxs = np.vstack((np.repeat(0, contour_end_idxs.shape[1]), contour_end_idxs[0:-1]))
+    contour_idxs_all = np.dstack((contour_start_idxs.T, contour_end_idxs.T))
 
-    contour_idxs_all = np.dstack((np.expand_dims(contour_start_idxs, 1), np.expand_dims(contour_end_idxs, 1)))
-
-    return [np.vstack(cnt_list) for cnt_list in contours], contour_idxs_all, contour_areas
+    return [np.vstack(cnt_list) for cnt_list in contours_all], contour_idxs_all, contour_areas
 
 
 def save_training_data(data_count):
@@ -317,10 +320,21 @@ def save_training_data(data_count):
     foot_hsv_ranges_lr = np.stack((get_hsv_range(foot_bgr_lr[0], (10, 70, 70)),
                                    get_hsv_range(foot_bgr_lr[1], (10, 70, 70))))
 
+    rotation_matrix = get_rotation_matrix(0, 360)
     '''while child_comm_mp[ChildCommIdxs.child_ready] != 0:
         pass'''
-    test_contour, test_idxs, test_area = return_contour_data_from_cam(child_comm_mp, img_view, foot_hsv_ranges_lr, 10, prompt='Test')
+    test_contour, test_idxs, test_area = return_contour_data_from_cam(child_comm_mp, img_view, foot_hsv_ranges_lr, 10, 100, prompt='Test')
+    max_val = np.max(np.abs(test_contour))
+    img_data = np.zeros((test_idxs.shape[0], test_idxs.shape[1], 360, (max_val + 5) * 2, (max_val + 5) * 2), dtype=np.uint8)
+
+    for i, idxs in enumerate(test_idxs):
+        for idx_i, idx in enumerate(idxs):
+            contour_points_rotated = np.dot(test_contour[i][idx[0]:idx[1]], rotation_matrix).astype(np.int16) + (img_data.shape[3] // 2, img_data.shape[4] // 2)
+            for rot_i, cnt in enumerate(contour_points_rotated):
+                cv2.drawContours(img_data[i][idx_i][rot_i], [np.reshape(cnt, (cnt.shape[1], 1, 2))], 0, (255, 255, 255), -1)
+
     print('b')
+
 
 
 def get_cx_cy_from_contour(cnt) -> (int, int) or None:
