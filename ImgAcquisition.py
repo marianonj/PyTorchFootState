@@ -276,15 +276,17 @@ def np_dtype_from_max(max_val, signed=False):
 
 
 def return_contour_data_from_cam(child_comm_mp, img_view, hsv_ranges, desired_data_count, sample_count, prompt, prompt_delay=1, all_valid=False, area_cutoffs=None):
-    contour_areas = np.zeros((desired_data_count, hsv_ranges.shape[0]), dtype=np.uint16)
-    counts = np.zeros(hsv_ranges.shape[0], dtype=np_dtype_from_max(desired_data_count))
+    contour_areas = np.zeros((sample_count, hsv_ranges.shape[0]), dtype=np.uint16)
+    final_contour_areas = np.zeros((desired_data_count, hsv_ranges.shape[0]), dtype=np.uint16)
+    counts = np.zeros(hsv_ranges.shape[0], dtype=np_dtype_from_max(sample_count))
     bboxs = np.zeros((hsv_ranges.shape[0], 4), dtype=np_dtype_from_max(np.max(Camera.max_aoi_yx.max()), signed=True))
     contours_all = [[] for _ in range(hsv_ranges.shape[0])]
     if area_cutoffs is None: area_cutoffs = np.zeros(hsv_ranges.shape[0], dtype=np.bool_)
 
     print(prompt), print(f'Starting data collection in {prompt_delay} seconds'), time.sleep(prompt_delay), print('Starting data collection')
+
     while np.any(counts != sample_count):
-        idxs = np.argwhere(counts != desired_data_count).flatten()
+        idxs = np.argwhere(counts != sample_count).flatten()
         cam_img = cv2.cvtColor(get_camera_img(child_comm_mp, img_view, hsv_ranges), cv2.COLOR_BGR2HSV)
         contours, area = get_contours_from_hsv_img(cam_img, hsv_ranges[idxs], bboxs, area_cutoffs[idxs], all_valid)
         if contours:
@@ -295,15 +297,28 @@ def return_contour_data_from_cam(child_comm_mp, img_view, hsv_ranges, desired_da
             contour_areas[counts[data_storage_idxs], data_storage_idxs] = area[valid_contours_is]
             counts[data_storage_idxs] += 1
 
+
+    #Returns valid samples based on contour area
+    #Sample count = desired_data_count
+    for cnt_i, cnt_area in enumerate(contour_areas.T):
+        min_val, max_val = cnt_area.min(), cnt_area.max()
+        area_sorted, sort_idxs = np.sort(cnt_area), np.argsort(cnt_area).flatten()
+        lin_space = np.linspace(min_val, max_val, num=desired_data_count).astype(np.uint16)[::-1]
+        search = np.searchsorted(area_sorted, lin_space)
+        print('b')
+        contours_all[cnt_i] = [contours_all[cnt_i][sort_idxs[i]] for i in search]
+        final_contour_areas[:, cnt_i] = area_sorted[search]
+
     contour_end_idxs = []
     for contour in contours_all:
         contour_end_idxs.append(np.cumsum([cnt.shape[0] for cnt in contour]))
+
 
     contour_end_idxs = np.column_stack(contour_end_idxs)
     contour_start_idxs = np.vstack((np.repeat(0, contour_end_idxs.shape[1]), contour_end_idxs[0:-1]))
     contour_idxs_all = np.dstack((contour_start_idxs.T, contour_end_idxs.T))
 
-    return [np.vstack(cnt_list) for cnt_list in contours_all], contour_idxs_all, contour_areas
+    return [np.vstack(cnt_list) for cnt_list in contours_all], contour_idxs_all, final_contour_areas
 
 
 def save_training_data(data_count):
@@ -323,7 +338,7 @@ def save_training_data(data_count):
     rotation_matrix = get_rotation_matrix(0, 360)
     '''while child_comm_mp[ChildCommIdxs.child_ready] != 0:
         pass'''
-    test_contour, test_idxs, test_area = return_contour_data_from_cam(child_comm_mp, img_view, foot_hsv_ranges_lr, 10, 100, prompt='Test')
+    test_contour, test_idxs, test_area = return_contour_data_from_cam(child_comm_mp, img_view, foot_hsv_ranges_lr, 10, 25, prompt='Test')
     max_val = np.max(np.abs(test_contour))
     img_data = np.zeros((test_idxs.shape[0], test_idxs.shape[1], 360, (max_val + 5) * 2, (max_val + 5) * 2), dtype=np.uint8)
 
@@ -332,8 +347,6 @@ def save_training_data(data_count):
             contour_points_rotated = np.dot(test_contour[i][idx[0]:idx[1]], rotation_matrix).astype(np.int16) + (img_data.shape[3] // 2, img_data.shape[4] // 2)
             for rot_i, cnt in enumerate(contour_points_rotated):
                 cv2.drawContours(img_data[i][idx_i][rot_i], [np.reshape(cnt, (cnt.shape[1], 1, 2))], 0, (255, 255, 255), -1)
-
-    print('b')
 
 
 
@@ -345,7 +358,7 @@ def get_cx_cy_from_contour(cnt) -> (int, int) or None:
         return None
 
 
-def get_contours_from_hsv_img(hsv_img, hsv_ranges, bboxs, area_cutoffs, valid_only_if_all_found) -> None or ((np.ndarray or None, [...]),
+def get_contours_from_hsv_img(hsv_img, hsv_ranges, bboxs, area_cutoffs, only_valid_if_all_found) -> None or ((np.ndarray or None, [...]),
                                                                                                              (np.ndarray or None, [...])):
     contours_all, areas, = [], []
 
@@ -355,7 +368,7 @@ def get_contours_from_hsv_img(hsv_img, hsv_ranges, bboxs, area_cutoffs, valid_on
         contours = list(cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)[0])
 
         if not contours:
-            if valid_only_if_all_found:
+            if only_valid_if_all_found:
                 return False, False
             else:
                 contours_all.append(None), areas.append(0)
@@ -365,7 +378,7 @@ def get_contours_from_hsv_img(hsv_img, hsv_ranges, bboxs, area_cutoffs, valid_on
         cx_cy = get_cx_cy_from_contour(contours[-1])
 
         if not cx_cy:
-            if valid_only_if_all_found:
+            if only_valid_if_all_found:
                 return False, False
             else:
                 contours_all.append(None), areas.append(0)
